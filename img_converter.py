@@ -14,7 +14,7 @@ from tkinterdnd2 import TkinterDnD, DND_FILES
 class ImageConverterApp:
     def __init__(self, master):
         self.master = master
-        master.title("Image Converter — PNG/JPG → JPG")
+        master.title("Image Converter — PNG/JPG → JPG/WebP")
         master.geometry("740x820")
 
         self.input_folder = StringVar()
@@ -23,6 +23,7 @@ class ImageConverterApp:
         self.process_subfolders = BooleanVar(value=False)
         self.process_png = BooleanVar(value=True)
         self.process_jpg = BooleanVar(value=True)
+        self.output_format = StringVar(value="JPG")
 
         self.resize_enabled = BooleanVar(value=False)
         self.resize_mode = StringVar(value="Max dimension")
@@ -62,7 +63,7 @@ class ImageConverterApp:
         options_frame.pack(pady=10, padx=10, fill='x')
         Label(options_frame, text="Conversion Options", font=("Arial", 10, "bold")).pack(pady=5)
 
-        Checkbutton(options_frame, text="Overwrite existing JPGs", variable=self.overwrite_existing).pack(anchor='w', padx=10)
+        Checkbutton(options_frame, text="Overwrite existing files", variable=self.overwrite_existing).pack(anchor='w', padx=10)
         Checkbutton(options_frame, text="Process subfolders", variable=self.process_subfolders).pack(anchor='w', padx=10)
 
         formats_row = Frame(options_frame)
@@ -71,10 +72,15 @@ class ImageConverterApp:
         Checkbutton(formats_row, text="PNG", variable=self.process_png).pack(side='left', padx=4)
         Checkbutton(formats_row, text="JPG/JPEG", variable=self.process_jpg).pack(side='left', padx=4)
 
+        output_row = Frame(options_frame)
+        output_row.pack(anchor='w', padx=10, pady=(2, 8))
+        Label(output_row, text="Output format:").pack(side='left')
+        OptionMenu(output_row, self.output_format, "JPG", "WebP").pack(side='left', padx=4)
+
         # --- JPG Quality Slider ---
         quality_frame = Frame(master)
         quality_frame.pack(pady=10, fill='x', padx=10)
-        self.quality_label = Label(quality_frame, text="JPG Quality:")
+        self.quality_label = Label(quality_frame, text="Quality:")
         self.quality_label.pack(side='left', padx=(0, 5))
         self.quality_slider = Scale(quality_frame, from_=1, to=100, orient=HORIZONTAL, label="Quality %", length=300)
         self.quality_slider.set(90)
@@ -246,9 +252,15 @@ class ImageConverterApp:
         return img.resize(new_size, Image.Resampling.LANCZOS)
 
     @staticmethod
-    def _flatten_to_rgb(img):
-        # Composite onto white if there's transparency; otherwise convert to RGB.
-        if img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info):
+    def _prepare_image(img, output_format):
+        has_alpha = img.mode in ('RGBA', 'LA') or (img.mode == 'P' and 'transparency' in img.info)
+        if output_format == "WebP":
+            # WebP supports transparency, so keep the alpha channel.
+            if has_alpha:
+                return img if img.mode == 'RGBA' else img.convert('RGBA')
+            return img if img.mode == 'RGB' else img.convert('RGB')
+        # JPEG has no alpha channel; composite onto white if there's transparency.
+        if has_alpha:
             rgba = img.convert('RGBA')
             bg = Image.new('RGB', rgba.size, 'white')
             bg.paste(rgba, mask=rgba.split()[-1])
@@ -256,6 +268,13 @@ class ImageConverterApp:
         if img.mode != 'RGB':
             return img.convert('RGB')
         return img
+
+    @staticmethod
+    def _save_image(img, path, output_format, quality):
+        if output_format == "WebP":
+            img.save(path, "WEBP", quality=quality)
+        else:
+            img.save(path, "JPEG", quality=quality, optimize=True)
 
     def start_conversion_thread(self):
         input_path = self.input_folder.get()
@@ -303,14 +322,15 @@ class ImageConverterApp:
             target=self._run_conversion,
             args=(input_path, output_path, jpg_quality, tuple(exts),
                   self.overwrite_existing.get(), self.process_subfolders.get(),
-                  resize),
+                  resize, self.output_format.get()),
             daemon=True,
         )
         conversion_thread.start()
         self.master.after(100, self.check_conversion_thread, conversion_thread)
 
     def _run_conversion(self, input_folder, output_folder, quality, exts,
-                        overwrite, process_subfolders, resize):
+                        overwrite, process_subfolders, resize, output_format):
+        out_ext = ".webp" if output_format == "WebP" else ".jpg"
         files_to_convert = []
         if process_subfolders:
             for root, _, files in os.walk(input_folder):
@@ -354,11 +374,11 @@ class ImageConverterApp:
                     continue
 
             stem = os.path.splitext(os.path.basename(src_path))[0]
-            jpg_path = os.path.join(current_output_folder, stem + ".jpg")
+            out_path = os.path.join(current_output_folder, stem + out_ext)
 
-            same_file = os.path.abspath(src_path) == os.path.abspath(jpg_path)
+            same_file = os.path.abspath(src_path) == os.path.abspath(out_path)
 
-            if os.path.exists(jpg_path) and not overwrite and not same_file:
+            if os.path.exists(out_path) and not overwrite and not same_file:
                 skipped_count += 1
                 self.master.after(0, lambda fn=os.path.basename(src_path):
                                   self.progress_label.config(text=f"Skipping: {fn} (already exists)"))
@@ -374,16 +394,16 @@ class ImageConverterApp:
             try:
                 with Image.open(src_path) as img:
                     img.load()
-                    img = self._flatten_to_rgb(img)
+                    img = self._prepare_image(img, output_format)
                     img = self._apply_resize(img, resize)
 
                     if same_file:
                         # Write to a temp file in the same folder, then atomically replace.
-                        fd, tmp_path = tempfile.mkstemp(suffix=".jpg", dir=current_output_folder)
+                        fd, tmp_path = tempfile.mkstemp(suffix=out_ext, dir=current_output_folder)
                         os.close(fd)
                         try:
-                            img.save(tmp_path, "JPEG", quality=quality, optimize=True)
-                            os.replace(tmp_path, jpg_path)
+                            self._save_image(img, tmp_path, output_format, quality)
+                            os.replace(tmp_path, out_path)
                         except Exception:
                             if os.path.exists(tmp_path):
                                 try:
@@ -392,7 +412,7 @@ class ImageConverterApp:
                                     pass
                             raise
                     else:
-                        img.save(jpg_path, "JPEG", quality=quality, optimize=True)
+                        self._save_image(img, out_path, output_format, quality)
 
                 converted_count += 1
                 self.master.after(0, lambda fn=os.path.basename(src_path), q=quality:
@@ -406,7 +426,7 @@ class ImageConverterApp:
 
         self.master.after(0, lambda: messagebox.showinfo(
             "Conversion Complete",
-            f"Converted {converted_count} of {total_files} images to JPG."
+            f"Converted {converted_count} of {total_files} images to {output_format}."
             + (f"\nSkipped: {skipped_count}" if skipped_count else "")
         ))
         self.master.after(0, self._conversion_finished)
